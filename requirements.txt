@@ -1,0 +1,4 @@
+# requirements.txt para Puente-Unidireccional
+# La mayoría de los módulos usados son parte de la librería estándar de Python.
+# Tkinter suele venir preinstalado, pero si usas Anaconda o Linux, puedes necesitar instalarlo manualmente.
+

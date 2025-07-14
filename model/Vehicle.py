@@ -24,3 +24,9 @@ class Vehicle:
         self.velocidad = velocidad
         self.tiempo_retraso = tiempo_retraso
         self.direccion = direccion 
+        
+    def cambiar_direccion(self):
+        """
+        Cambia la dirección del vehículo (LEFT <-> RIGHT)
+        """
+        self.direccion = Direccion.LEFT if self.direccion == Direccion.RIGHT else Direccion.RIGHT 

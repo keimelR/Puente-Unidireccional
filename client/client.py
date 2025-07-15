@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import datetime
+from datetime import timezone
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from model.Vehicle import Vehicle
 from model.MessageType import MessageType
@@ -11,6 +12,7 @@ import random
 import socket
 import json
 import time
+import threading
 
 # Configurar logging
 logging.basicConfig(
@@ -48,6 +50,8 @@ class Client:
         self.host = host
         self.port = port
         self.client_socket = None
+        self.is_connected = False
+        self.is_running = True # Para controlar la ejecución del hilo receptor
         
         self.vehicle = Vehicle(
             id = id,
@@ -55,86 +59,193 @@ class Client:
             tiempo_retraso = tiempo_retraso,
             direccion = direccion 
         )
+        self.permission_event = threading.Event()
+        self.last_server_message = None
+        self.lock = threading.Lock()
         
-        self.conexion()  # Establecer conexión persistente al crear el cliente
+        # Iniciar la conexión y el hilo receptor al crear el cliente
+        self.conexion()
+        if self.is_connected:
+            self.receiver_thread = threading.Thread(target=self.listen_server, daemon=True)
+            self.receiver_thread.start()
         
     def conexion(self):
-        try:
-            self.client_socket = socket.socket(socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_STREAM)
-            self.client_socket.settimeout(None)
-            self.client_socket.connect((self.host, self.port))
-            logger.info(f"[{self.vehicle.id}] Conectado a {self.host}:{self.port}")
-        except Exception as e:
-            logger.error(f"[ERROR] Fallo al conectar con el servidor: {e}")
-            sys.exit(1)
-        
-    def enviar(self, message_type):
-        """
-        Envía un mensaje al servidor usando el socket persistente y espera la respuesta.
-        """
-        if self.client_socket is None:
-            raise RuntimeError("El socket del cliente no está inicializado. Llama a self.conexion() antes de enviar mensajes.")
-        mensaje = self.mensaje_template(message_type=message_type)
         retries = 0
-        while retries < self.MAX_RETRIES:
+        while retries < self.MAX_RETRIES and not self.is_connected:
             try:
-                self.client_socket.send((json.dumps(mensaje) + "\n").encode())
-                respuesta = b""
-                while True:
-                    parte = self.client_socket.recv(1024)
-                    if not parte:
-                        raise ConnectionResetError("Conexión cerrada por el servidor.")
-                    respuesta += parte
-                    if b"\n" in respuesta:
-                        msg_bytes, respuesta = respuesta.split(b"\n", 1)
-                        logger.debug(f"[DEBUG CLIENTE] Respuesta cruda recibida: {msg_bytes}")
-                        return json.loads(msg_bytes.decode())
-                raise RuntimeError("No se recibió respuesta del servidor.")
-            except (socket.timeout, ConnectionResetError, BrokenPipeError) as e:
+                if self.client_socket:
+                    self.client_socket.close() # Asegurarse de que el socket anterior esté cerrado
+                self.client_socket = socket.socket(socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_STREAM)
+                self.client_socket.settimeout(5) # Timeout más largo para evitar logs innecesarios de socket.timeout
+                self.client_socket.connect((self.host, self.port))
+                self.is_connected = True
+                logger.info(f"[{self.vehicle.id}] Conectado a {self.host}:{self.port}")
+                break
+            except (socket.error, OSError) as e:
                 retries += 1
-                logger.warning(f"[ERROR] Problema de red o timeout: {e}. Intentando reconectar ({retries}/{self.MAX_RETRIES})...")
-                self.cerrar()
-                time.sleep(1)
+                logger.warning(f"[ERROR] Fallo al conectar con el servidor: {e}. Reintentando ({retries}/{self.MAX_RETRIES})...")
+                time.sleep(2 ** retries) # Espera exponencial
+        if not self.is_connected:
+            logger.error(f"[FATAL] No se pudo conectar con el servidor después de {self.MAX_RETRIES} intentos. Cerrando cliente.")
+            self.is_running = False
+            sys.exit(1)
+            
+    def _send_raw_message(self, message):
+        """Envía un mensaje JSON al servidor sin esperar respuesta."""
+        if not self.is_connected or self.client_socket is None:
+            logger.error(f"[{self.vehicle.id}] No se pudo enviar el mensaje, el cliente no está conectado.")
+            return False
+        
+        try:
+            message_str = json.dumps(message) + "\n"
+            self.client_socket.sendall(message_str.encode('utf-8'))
+            logger.debug(f"[{self.vehicle.id}] Mensaje enviado: {message['type']}")
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.error(f"[{self.vehicle.id}] Error al enviar mensaje: {e}. Reconectando...")
+            self.is_connected = False
+            self.conexion() # Intentar reconectar
+            return False
+        except Exception as e:
+            logger.error(f"[{self.vehicle.id}] Error inesperado al enviar mensaje: {e}")
+            return False
+
+    def listen_server(self):
+        """
+        Hilo receptor que escucha mensajes del servidor y actualiza el estado del cliente.
+        """
+        buffer = b""
+        while self.is_running:
+            if not self.is_connected or self.client_socket is None:
+                time.sleep(1) # Esperar antes de reintentar si no está conectado
+                continue
+            try:
+                data = self.client_socket.recv(4096)
+                if not data: # Servidor cerró la conexión
+                    logger.warning(f"[{self.vehicle.id}] Servidor desconectado. Intentando reconectar...")
+                    self.is_connected = False
+                    self.conexion()
+                    continue
+                
+                buffer += data
+                while b"\n" in buffer:
+                    msg_bytes, buffer = buffer.split(b"\n", 1)
+                    if not msg_bytes.strip(): # Saltar líneas vacías
+                        continue
+                    try:
+                        message = json.loads(msg_bytes.decode('utf-8'))
+                        with self.lock:
+                            self.last_server_message = message
+                        logger.info(f"[{self.vehicle.id}] Recibido del servidor: {message.get('type', message.get('status'))} - {message.get('message')}")
+                        
+                        # Activar evento si se concede permiso
+                        if (message.get('status') == MessageType.PERMISSION_GRANTED.value):
+                            expected_dir = message.get('expected_direction')
+                            if expected_dir and self.vehicle.direccion.value != expected_dir:
+                                # Si el servidor indica una dirección esperada diferente a la actual del cliente,
+                                # la actualizamos. Esto es crucial si el scheduler del servidor está intentando
+                                # coordinar la dirección.
+                                logger.info(f"[{self.vehicle.id}] Ajustando dirección a la esperada por el servidor: {expected_dir}")
+                                self.vehicle.direccion = Direccion(expected_dir)
+                            self.permission_event.set() # Activa el evento para la lógica de cruce
+                        elif (message.get('status') == MessageType.PERMISSION_DENIED.value):
+                            self.permission_event.clear() # Limpiar si el permiso es denegado
+                            logger.info(f"[{self.vehicle.id}] Permiso denegado.")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[{self.vehicle.id}] Error al decodificar JSON: {e} - Data: {msg_bytes}")
+                        buffer = b"" 
+            except socket.timeout:
+                pass # Esto es normal si no hay datos disponibles
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                logger.error(f"[{self.vehicle.id}] Error de conexión en hilo receptor: {e}. Reconectando...")
+                self.is_connected = False
                 self.conexion()
-        logger.error(f"[FATAL] Se superó el máximo de intentos de reconexión ({self.MAX_RETRIES}). Cerrando cliente.")
-        self.cerrar()
-        sys.exit(1)
+            except Exception as e:
+                logger.error(f"[{self.vehicle.id}] Error inesperado en hilo receptor: {e}")
+                self.is_running = False # Detener el hilo si hay un error grave
 
     def cruzar(self):
         """
         Establece las acciones del vehiculo para cruzar el puente
         """
-        try:
-            while True:   
-                # Envia una solicitud para cruzar el puente
-                resp = self.enviar(MessageType.REQUEST.value)
-                logger.info(f"[{self.vehicle.id}] Estado: {resp['status']} - {resp['message']}")
+        while self.is_running:
+            self.permission_event.clear() # Asegurarse de que el evento esté limpio antes de esperar
+            
+            # Bucle para manejar la solicitud inicial y posibles reintentos
+            while self.is_running:
+                logger.info(f"[{self.vehicle.id}] Solicitando permiso para cruzar en dirección: {self.vehicle.direccion.value}")
+                if not self._send_raw_message(self.mensaje_template(MessageType.REQUEST.value)):
+                    time.sleep(2) # Esperar un poco si falló el envío y reintentar
+                    continue # Reintentar el envío del REQUEST
                 
-                # Si la respuesta de la solicitud es afirmativa
-                if resp['status'] == "Exitoso":
-                    # Simula tiempo en el puente
-                    tiempo_cruce = random.uniform(1, self.vehicle.velocidad)
-                    logger.info(f"[{self.vehicle.id}] Cruzando puente por {tiempo_cruce:.2f} segundos...")
-                    time.sleep(tiempo_cruce)
+                logger.info(f"[{self.vehicle.id}] Solicitud enviada. Esperando permiso para cruzar...")
+                
+                # Esperar la respuesta del servidor
+                # Aumentamos el timeout ligeramente a 20s para dar más margen en escenarios de alta concurrencia o esperas de scheduler.
+                if self.permission_event.wait(timeout=20): 
+                    with self.lock:
+                        last_msg = self.last_server_message
                     
-                    # Notifica fin de cruce                
-                    resp_end = self.enviar(MessageType.END_CROSS.value)
-                    logger.info(f"[{self.vehicle.id}] Terminó de cruzar. Respuesta: {resp_end}")
-                    
-                    # Espera antes de volver a intentar
-                    tiempo_espera = random.uniform(1, self.vehicle.tiempo_retraso)
-                    logger.info(f"[{self.vehicle.id}] Esperando {tiempo_espera:.2f} segundos antes de volver a cruzar.")
-                    time.sleep(tiempo_espera)
-                    
-                    # Cambia dirección para simular tráfico bidireccional
-                    self.vehicle.cambiar_direccion()  # type: ignore
-                    logger.info(f"[{self.vehicle.id}] Cambia dirección a: {self.vehicle.direccion.value}")
+                    if last_msg and last_msg.get('status') == MessageType.PERMISSION_GRANTED.value:
+                        # Si el permiso es concedido directamente, procedemos a cruzar
+                        logger.info(f"[{self.vehicle.id}] ¡Permiso concedido! Preparándose para cruzar.")
+                        self.permission_event.clear() # Limpiar el evento
+                        break # Salir del bucle interno y proceder a cruzar
+                    elif last_msg and last_msg.get('status') == MessageType.PERMISSION_DENIED.value:
+                        logger.warning(f"[{self.vehicle.id}] Permiso denegado explícitamente. Esperando notificación del scheduler.")
+                        self.permission_event.clear() # Limpiar si el permiso es denegado
+                        time.sleep(5) # Espera pasiva de 5 segundos. No reintenta el REQUEST inmediatamente.
+                        
+                        # --- INICIO DEL CAMBIO CLAVE ---
+                        # Después de la espera pasiva, verificamos si el scheduler nos ha enviado un PERMISSION_GRANTED
+                        # durante ese tiempo o justo después.
+                        with self.lock:
+                            # Volvemos a capturar el último mensaje por si llegó algo mientras esperábamos
+                            current_last_msg = self.last_server_message 
+                            if self.permission_event.is_set() and current_last_msg and current_last_msg.get('status') == MessageType.PERMISSION_GRANTED.value:
+                                logger.info(f"[{self.vehicle.id}] Recibido permiso del scheduler después de espera pasiva. ¡Procediendo a cruzar!")
+                                self.permission_event.clear()
+                                break # Salir del bucle interno y proceder a cruzar
+                            else:
+                                # Si no se recibió un PERMISSION_GRANTED explícito del scheduler después de la espera,
+                                # entonces el cliente vuelve a solicitar para intentar de nuevo.
+                                logger.info(f"[{self.vehicle.id}] No se recibió permiso del scheduler. Reintentando solicitud.")
+                                continue # Esto hace que el bucle interno se repita, enviando un nuevo REQUEST.
+                        # --- FIN DEL CAMBIO CLAVE ---
+
+                    else:
+                        # Esto manejaría casos donde se recibe un mensaje inesperado o el timeout ocurre (si el wait no retornó True)
+                        logger.warning(f"[{self.vehicle.id}] Recibido un mensaje inesperado o timeout. Reintentando solicitud.")
+                        self.permission_event.clear()
+                        continue # Reintentar solicitud
                 else:
-                    logger.info(f"[{self.vehicle.id}] Esperando para volver a intentar...")
-                    # Espera antes de volver a solicitar
-                    time.sleep(1)
-        finally:
-            self.cerrar()
+                    # Si el timeout ocurre sin recibir PERMISSION_GRANTED o DENIED (permission_event.wait() retorna False)
+                    logger.warning(f"[{self.vehicle.id}] No recibió respuesta a tiempo. Reintentando solicitud...")
+                    self.permission_event.clear()
+                    continue # Reintentar solicitud
+
+            # --- A partir de aquí, el coche TIENE permiso para cruzar ---
+            tiempo_cruce = random.uniform(1, self.vehicle.velocidad)
+            logger.info(f"[{self.vehicle.id}] Cruzando puente por {tiempo_cruce:.2f} segundos...")
+            time.sleep(tiempo_cruce)
+            
+            # Notifica fin de cruce
+            if not self._send_raw_message(self.mensaje_template(MessageType.END_CROSS.value)):
+                logger.error(f"[{self.vehicle.id}] No se pudo notificar el fin del cruce.")
+            
+            logger.info(f"[{self.vehicle.id}] Terminó de cruzar. Esperando antes de volver a intentar.")
+            
+            # Espera antes de volver a intentar
+            tiempo_espera = random.uniform(1, self.vehicle.tiempo_retraso)
+            logger.info(f"[{self.vehicle.id}] Esperando {tiempo_espera:.2f} segundos antes de volver a cruzar.")
+            time.sleep(tiempo_espera)
+            
+            # Cambia dirección para simular tráfico bidireccional
+            self.vehicle.cambiar_direccion() # type: ignore
+            logger.info(f"[{self.vehicle.id}] Cambia dirección a: {self.vehicle.direccion.value}")
+        
+        logger.info(f"[{self.vehicle.id}] Hilo de cruce finalizado.")
+
 
     def mensaje_template(self, message_type):
         """
@@ -150,33 +261,60 @@ class Client:
             'id': self.vehicle.id,
             'direction': self.vehicle.direccion.value,
             'type': message_type,
-            'timestamp': datetime.datetime.utcnow().isoformat()
+            'timestamp': datetime.datetime.now(timezone.utc).isoformat()
         }
         
     def cerrar(self):
+        logger.info(f"[{self.vehicle.id}] Cerrando cliente.")
+        self.is_running = False # Señal para detener el hilo receptor
         if self.client_socket is not None:
-            self.client_socket.close()
-            self.client_socket = None
+            try:
+                self.client_socket.shutdown(socket.SHUT_RDWR) # Intentar un cierre limpio
+                self.client_socket.close()
+            except Exception as e:
+                logger.error(f"[{self.vehicle.id}] Error al cerrar socket: {e}")
+            finally:
+                self.client_socket = None
+        if hasattr(self, 'receiver_thread') and self.receiver_thread.is_alive():
+            self.receiver_thread.join(timeout=2) # Esperar un poco a que el hilo termine
+
 
 if __name__ == "__main__":
     print("=== Cliente de Puente Unidireccional ===")
     id_vehiculo = input("ID del vehículo: ")
     host = "127.0.0.1"
     port = 7777
-    velocidad = float(input("Velocidad máxima (segundos en puente, ej: 3): "))
-    tiempo_retraso = float(input("Tiempo de retraso tras cruzar (segundos, ej: 2): "))
     
+    while True:
+        try:
+            velocidad = float(input("Velocidad máxima (segundos en puente, ej: 3): "))
+            if velocidad <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Entrada inválida. Por favor, ingresa un número positivo.")
+            
+    while True:
+        try:
+            tiempo_retraso = float(input("Tiempo de retraso tras cruzar (segundos, ej: 2): "))
+            if tiempo_retraso <= 0:
+                raise ValueError
+            break
+        except ValueError:
+            print("Entrada inválida. Por favor, ingresa un número positivo.")
+            
     # Validación de dirección inicial
-    dir_inicial = input("Dirección inicial [left/right]: ").strip().lower()
-    if dir_inicial not in ["left", "right"]:
-        print("Dirección inválida. Debe ser 'left' o 'right'.")
-        sys.exit(1)
+    while True:
+        dir_inicial = input("Dirección inicial [left/right]: ").strip().lower()
+        if dir_inicial == "left":
+            direccion = Direccion.LEFT
+            break
+        elif dir_inicial == "right":
+            direccion = Direccion.RIGHT
+            break
+        else:
+            print("Dirección inválida. Debe ser 'left' o 'right'.")
     
-    if dir_inicial == "right":
-        direccion = Direccion.RIGHT
-    else:
-        direccion = Direccion.LEFT
-
     client = Client(
         id=id_vehiculo,
         host=host,
@@ -188,5 +326,6 @@ if __name__ == "__main__":
     try:
         client.cruzar()
     except KeyboardInterrupt:
-        logger.info("Cerrando cliente...")
+        logger.info("Cerrando cliente por interrupción del usuario...")
+    finally:
         client.cerrar()

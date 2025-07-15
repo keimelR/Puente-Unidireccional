@@ -401,21 +401,20 @@ class Server:
 
     def notify_car_can_cross(self, car_id):
         """Notifica a un vehículo específico que puede cruzar el puente (desde el scheduler)."""
-        with self.bridge_lock:
-            client_socket = self.active_clients.get(car_id)
-            if client_socket:
-                notification = self.template_response(
-                    status=MessageType.PERMISSION_GRANTED.value,
-                    message='Tu turno ha llegado. ¡Envía un REQUEST para cruzar!',
-                    current_direction=self.current_direction
-                )
-                notification['expected_direction'] = self.current_direction.value
-                if self._send_response(client_socket, notification, car_id):
-                    print(f"[NOTIFICACIÓN] Enviada a {car_id}: puede cruzar (desde scheduler).")
-                else:
-                    print(f"[ADVERTENCIA] No se pudo enviar notificación a {car_id}, socket posiblemente cerrado.")
+        client_socket = self.active_clients.get(car_id)
+        if client_socket:
+            notification = self.template_response(
+                status=MessageType.PERMISSION_GRANTED.value,
+                message='Tu turno ha llegado. ¡Envía un REQUEST para cruzar!',
+                current_direction=self.current_direction
+            )
+            notification['expected_direction'] = self.current_direction.value
+            if self._send_response(client_socket, notification, car_id):
+                print(f"[NOTIFICACIÓN] Enviada a {car_id}: puede cruzar (desde scheduler).")
             else:
-                print(f"[ADVERTENCIA] No se encontró socket para notificar a {car_id}. Posiblemente se desconectó y fue limpiado.")
+                print(f"[ADVERTENCIA] No se pudo enviar notificación a {car_id}, socket posiblemente cerrado.")
+        else:
+            print(f"[ADVERTENCIA] No se encontró socket para notificar a {car_id}. Posiblemente se desconectó y fue limpiado.")
 
 
     def client_disconnect(self, client_id):
@@ -462,18 +461,10 @@ class Server:
         print(f"---------------------------------")
 
     def puede_cruzar(self, car_id, car_direction):
-        # Si el puente está libre y es el notificado (o no hay notificado), puede cruzar SIEMPRE
+        # Solo puede cruzar si el puente está completamente libre y es el notificado (o no hay notificado)
         if self.cars_on_bridge == 0:
             if self.next_expected_car_id is None or self.next_expected_car_id == car_id:
                 return True
-            return False
-        # Si el puente está ocupado, solo puede cruzar si la dirección coincide y no hay coches esperando en la opuesta
-        if self.current_direction == car_direction:
-            if car_direction == Direccion.LEFT and self.right_traffic.qsize() > 0:
-                return False
-            if car_direction == Direccion.RIGHT and self.left_traffic.qsize() > 0:
-                return False
-            return True
         return False
     
     # La alternancia se gestiona ahora en next_car y el scheduler

@@ -277,6 +277,32 @@ class Client:
                 self.client_socket = None
         if hasattr(self, 'receiver_thread') and self.receiver_thread.is_alive():
             self.receiver_thread.join(timeout=2) # Esperar un poco a que el hilo termine
+            
+    def actualizar_estado_puente(self, bridge_state):
+        """
+        Solicita el estado del puente al servidor y actualiza el diccionario bridge_state.
+        """
+        if not self.is_connected:
+            return
+        try:
+            self._send_raw_message({
+                'id': self.vehicle.id,
+                'direction': self.vehicle.direccion.value,
+                'type': MessageType.STATUS_UPDATE.value,  # <-- aquí el cambio
+                'timestamp': datetime.datetime.now(timezone.utc).isoformat()
+            })
+            time.sleep(0.1)
+            with self.lock:
+                msg = self.last_server_message
+            if msg and msg.get('status') == MessageType.STATUS_UPDATE.value and msg.get('data'):
+                data = msg['data']
+                bridge_state["ocupado"] = data.get("bridge_occupied", False)
+                bridge_state["direccion"] = msg.get("current_direction", "LEFT")
+                bridge_state["en_puente"] = data.get("cars_on_bridge", [])
+                bridge_state["cola_izquierda"] = ["?"] * data.get("left_traffic_size", 0)
+                bridge_state["cola_derecha"] = ["?"] * data.get("right_traffic_size", 0)
+        except Exception as e:
+            logger.error(f"[{self.vehicle.id}] Error al actualizar estado del puente: {e}")
 
 
 if __name__ == "__main__":
@@ -329,3 +355,5 @@ if __name__ == "__main__":
         logger.info("Cerrando cliente por interrupción del usuario...")
     finally:
         client.cerrar()
+        
+    

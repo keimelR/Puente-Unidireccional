@@ -2,3 +2,9 @@
 # La mayoría de los módulos usados son parte de la librería estándar de Python.
 # Tkinter suele venir preinstalado, pero si usas Anaconda o Linux, puedes necesitar instalarlo manualmente.
 
+# Dependencias externas necesarias para la interfaz gráfica y cliente
+pygame>=2.0.0
+pygame_gui>=0.6.0
+# Para Tkinter (opcional, solo si no está instalado):
+# python3-tk
+

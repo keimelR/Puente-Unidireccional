@@ -17,3 +17,41 @@ Debe especificar los protocolos de la capa de transporte y de la capa de aplicac
 Evaluacion: 30 puntos
 * 15 puntos documento del diseno
 * 15 puntos  en implementacion ajustada a requerimientos
+
+# ¿Cómo correr este proyecto?
+
+Sigue estos pasos para ejecutar el sistema distribuido del puente unidireccional:
+
+1. **Clona o descarga este repositorio** en tu máquina local.
+
+2. **Instala las dependencias** necesarias:
+   - Asegúrate de tener Python 3.8 o superior instalado.
+   - Instala los paquetes requeridos ejecutando en la terminal (en la raíz del proyecto):
+     ```bash
+     pip install -r requirements.txt
+     ```
+   - Si usas Linux o Anaconda y no tienes Tkinter, instálalo manualmente:
+     - En Ubuntu/Debian: `sudo apt-get install python3-tk`
+     - En Anaconda: `conda install tk`
+
+3. **Inicia el servidor**:
+   - Ve a la carpeta `server` y ejecuta:
+     ```bash
+       python server\server.py
+     ```
+
+4. **Inicia uno o varios clientes**:
+   - Ve a la carpeta `presentation` y ejecuta:
+     ```bash
+     python presentation\main.py
+     ```
+   - Se abrirá una interfaz gráfica donde puedes configurar los parámetros del vehículo y conectarte al servidor.
+   - Puedes abrir varias instancias del cliente para simular varios vehículos.
+
+5. **Detén el sistema**:
+   - Para detener el servidor o los clientes, simplemente cierra la ventana o usa `Ctrl+C` en la terminal.
+
+**Notas:**
+- El servidor debe estar corriendo antes de iniciar cualquier cliente.
+- Si tienes problemas con la interfaz gráfica, revisa que `pygame` y `pygame_gui` estén correctamente instalados.
+- El sistema está diseñado para ejecutarse en Windows, pero puede funcionar en Linux/Mac con los paquetes adecuados.
